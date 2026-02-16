@@ -77,6 +77,22 @@ class Patio:
     depth_mm: int
 
 
+@dataclass(frozen=True)
+class InnerRect:
+    x0_mm: int
+    y0_mm: int
+    width_mm: int
+    depth_mm: int
+
+
+@dataclass
+class FillStats:
+    attempted_placements: int = 0
+    frontier_failures: int = 0
+    blocked_cells: int = 0
+    end_reason: str = "unknown"
+
+
 class OccupancyGrid:
     def __init__(self, width_mm: int, depth_mm: int, grid_mm: int = GRID_MM):
         self.grid_mm = grid_mm
@@ -250,12 +266,13 @@ def score_layout(layout: Layout, patio: Patio, slab_types: Sequence[SlabType]) -
     else:
         variety_pen = 50.0
 
-    coverage_score = coverage_ratio * 10000.0
-    uncovered_penalty = (1.0 - coverage_ratio) * 14000.0
-    cross_penalty = cross_count * 650.0
-    t_penalty = t_count * 45.0
+    # Coverage is the primary objective; pattern penalties are secondary tie-breakers.
+    coverage_score = coverage_ratio * 30000.0
+    uncovered_penalty = (1.0 - coverage_ratio) * 10000.0
+    cross_penalty = cross_count * 220.0
+    t_penalty = t_count * 20.0
 
-    total = coverage_score - uncovered_penalty - long_pen - cross_penalty - t_penalty - variety_pen
+    total = coverage_score - uncovered_penalty - 0.75 * long_pen - cross_penalty - t_penalty - 0.35 * variety_pen
 
     return ScoreBreakdown(
         score_total=total,
@@ -272,10 +289,23 @@ def score_layout(layout: Layout, patio: Patio, slab_types: Sequence[SlabType]) -
     )
 
 
+def has_joint_clearance(candidate: Placement, placements: Sequence[Placement], joint_mm: int) -> bool:
+    for p in placements:
+        no_conflict = (
+            candidate.right + joint_mm <= p.x_mm
+            or p.right + joint_mm <= candidate.x_mm
+            or candidate.bottom + joint_mm <= p.y_mm
+            or p.bottom + joint_mm <= candidate.y_mm
+        )
+        if not no_conflict:
+            return False
+    return True
+
+
 def build_candidate_placements(
     x: int,
     y: int,
-    patio: Patio,
+    inner: InnerRect,
     joint_mm: int,
     slabs: Sequence[SlabType],
     layout: Layout,
@@ -283,8 +313,8 @@ def build_candidate_placements(
     rng: random.Random,
 ) -> List[Placement]:
     out: List[Placement] = []
-    wall_x_limit = patio.width_mm
-    wall_y_limit = patio.depth_mm
+    x_limit = inner.x0_mm + inner.width_mm
+    y_limit = inner.y0_mm + inner.depth_mm
 
     slab_order = list(slabs)
     rng.shuffle(slab_order)
@@ -292,13 +322,14 @@ def build_candidate_placements(
     for slab in slab_order:
         if layout.used_counts.get(slab.name, 0) >= slab.count_available:
             continue
-        for w, h, rotated in slab.orientations():
-            wj = w + joint_mm
-            hj = h + joint_mm
-            if x + wj > wall_x_limit or y + hj > wall_y_limit:
+        orientations = slab.orientations()
+        rng.shuffle(orientations)
+        for w, h, rotated in orientations:
+            if x + w > x_limit or y + h > y_limit:
                 continue
-            if occ.is_free(x, y, wj, hj):
-                out.append(Placement(slab=slab.name, x_mm=x, y_mm=y, w_mm=w, h_mm=h, rotated=rotated))
+            cand = Placement(slab=slab.name, x_mm=x, y_mm=y, w_mm=w, h_mm=h, rotated=rotated)
+            if occ.is_free(x, y, w, h) and has_joint_clearance(cand, layout.placements, joint_mm):
+                out.append(cand)
     return out
 
 
@@ -310,33 +341,42 @@ def placement_delta_score(layout: Layout, placement: Placement, patio: Patio, sl
 
 
 def construct_layout(
-    patio: Patio,
+    inner: InnerRect,
     slabs: Sequence[SlabType],
     joint_mm: int,
     rng: random.Random,
-    max_steps: int = 10000,
-) -> Layout:
-    occ = OccupancyGrid(patio.width_mm, patio.depth_mm)
+    max_steps: Optional[int] = None,
+) -> Tuple[Layout, FillStats]:
+    occ = OccupancyGrid(inner.width_mm, inner.depth_mm)
     layout = Layout()
+    stats = FillStats()
+    if max_steps is None:
+        max_steps = occ.rows * occ.cols + 1
     steps = 0
 
     while steps < max_steps:
         steps += 1
         frontier = occ.first_empty()
         if frontier is None:
+            stats.end_reason = "no_frontier_empty_cells"
             break
-        x, y = frontier
-        cands = build_candidate_placements(x, y, patio, joint_mm, slabs, layout, occ, rng)
+        lx, ly = frontier
+        x = inner.x0_mm + lx
+        y = inner.y0_mm + ly
+        cands = build_candidate_placements(x, y, inner, joint_mm, slabs, layout, occ, rng)
         if not cands:
-            occ.set_rect(x, y, GRID_MM, GRID_MM, True)
+            occ.set_rect(lx, ly, GRID_MM, GRID_MM, True)
+            stats.frontier_failures += 1
+            stats.blocked_cells += 1
             continue
 
         weighted: List[Tuple[float, Placement]] = []
         for c in cands:
             base = c.area
             jitter = rng.uniform(0.9, 1.15)
-            score = placement_delta_score(layout, c, patio, slabs)
+            score = placement_delta_score(layout, c, Patio(inner.width_mm, inner.depth_mm), slabs)
             weighted.append((base * jitter + 0.001 * score, c))
+            stats.attempted_placements += 1
 
         weighted.sort(key=lambda t: t[0], reverse=True)
         top = weighted[: min(4, len(weighted))]
@@ -344,20 +384,24 @@ def construct_layout(
 
         layout.placements.append(pick)
         layout.used_counts[pick.slab] += 1
-        occ.set_rect(pick.x_mm, pick.y_mm, pick.w_mm + joint_mm, pick.h_mm + joint_mm, True)
+        occ.set_rect(pick.x_mm - inner.x0_mm, pick.y_mm - inner.y0_mm, pick.w_mm, pick.h_mm, True)
 
-    return layout
+    if steps >= max_steps and stats.end_reason == "unknown":
+        stats.end_reason = "max_steps_reached"
+
+    return layout, stats
 
 
 def improve_layout(
     base: Layout,
-    patio: Patio,
+    inner: InnerRect,
     slabs: Sequence[SlabType],
     joint_mm: int,
     rng: random.Random,
     iterations: int = 60,
 ) -> Layout:
     current = Layout(list(base.placements), defaultdict(int, base.used_counts))
+    patio = Patio(inner.width_mm, inner.depth_mm)
     current_score = score_layout(current, patio, slabs).score_total
 
     for i in range(iterations):
@@ -370,9 +414,9 @@ def improve_layout(
         for p in kept:
             candidate.used_counts[p.slab] += 1
 
-        occ = OccupancyGrid(patio.width_mm, patio.depth_mm)
+        occ = OccupancyGrid(inner.width_mm, inner.depth_mm)
         for p in kept:
-            occ.set_rect(p.x_mm, p.y_mm, p.w_mm + joint_mm, p.h_mm + joint_mm, True)
+            occ.set_rect(p.x_mm - inner.x0_mm, p.y_mm - inner.y0_mm, p.w_mm, p.h_mm, True)
 
         refill_steps = 0
         while refill_steps < 2500:
@@ -380,15 +424,17 @@ def improve_layout(
             frontier = occ.first_empty()
             if frontier is None:
                 break
-            x, y = frontier
-            cands = build_candidate_placements(x, y, patio, joint_mm, slabs, candidate, occ, rng)
+            lx, ly = frontier
+            x = inner.x0_mm + lx
+            y = inner.y0_mm + ly
+            cands = build_candidate_placements(x, y, inner, joint_mm, slabs, candidate, occ, rng)
             if not cands:
-                occ.set_rect(x, y, GRID_MM, GRID_MM, True)
+                occ.set_rect(lx, ly, GRID_MM, GRID_MM, True)
                 continue
             pick = max(cands, key=lambda c: c.area + rng.uniform(0, 2000))
             candidate.placements.append(pick)
             candidate.used_counts[pick.slab] += 1
-            occ.set_rect(pick.x_mm, pick.y_mm, pick.w_mm + joint_mm, pick.h_mm + joint_mm, True)
+            occ.set_rect(pick.x_mm - inner.x0_mm, pick.y_mm - inner.y0_mm, pick.w_mm, pick.h_mm, True)
 
         cand_score = score_layout(candidate, patio, slabs).score_total
         temp = max(0.01, 1.0 - i / iterations)
@@ -495,7 +541,7 @@ def write_svg(path: Path, patio: Patio, placements: Sequence[Placement], wall_ga
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def parse_input(path: Path) -> Tuple[Patio, int, int, List[SlabType], int, Optional[int]]:
+def parse_input(path: Path) -> Tuple[Patio, int, int, int, List[SlabType], int, float, Optional[int]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     patio_raw = data["patio"]
     patio = Patio(
@@ -504,6 +550,7 @@ def parse_input(path: Path) -> Tuple[Patio, int, int, List[SlabType], int, Optio
     )
     joint_mm = validate_dim("joint_mm", int(data.get("joint_mm", 10)))
     wall_gap_mm = max(0, clamp_to_grid(int(data.get("wall_gap_mm", 10))))
+    perimeter_gap_mm = max(0, clamp_to_grid(int(data.get("perimeter_gap_mm", 0))))
 
     slabs: List[SlabType] = []
     for s in data["slabs"]:
@@ -518,16 +565,19 @@ def parse_input(path: Path) -> Tuple[Patio, int, int, List[SlabType], int, Optio
         raise ValueError("No slab types with positive count were provided")
 
     num_solutions = max(1, int(data.get("num_solutions", 10)))
+    coverage_target = float(data.get("coverage_target", 0.95))
     seed = data.get("seed")
-    return patio, joint_mm, wall_gap_mm, slabs, num_solutions, (int(seed) if seed is not None else None)
+    return patio, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, num_solutions, coverage_target, (int(seed) if seed is not None else None)
 
 
-def apply_wall_gap(patio: Patio, wall_gap_mm: int) -> Patio:
-    width = patio.width_mm - 2 * wall_gap_mm
-    depth = patio.depth_mm - 2 * wall_gap_mm
+def compute_inner_rect(patio: Patio, wall_gap_mm: int, perimeter_gap_mm: int) -> InnerRect:
+    x0 = perimeter_gap_mm
+    y0 = wall_gap_mm + perimeter_gap_mm
+    width = patio.width_mm - 2 * perimeter_gap_mm
+    depth = patio.depth_mm - wall_gap_mm - 2 * perimeter_gap_mm
     if width <= 0 or depth <= 0:
-        raise ValueError("wall_gap_mm leaves no patio area")
-    return Patio(width_mm=width, depth_mm=depth)
+        raise ValueError("wall/perimeter gaps leave no patio area")
+    return InnerRect(x0_mm=x0, y0_mm=y0, width_mm=width, depth_mm=depth)
 
 
 def shift_layout(layout: Layout, dx: int, dy: int) -> Layout:
@@ -541,10 +591,11 @@ def shift_layout(layout: Layout, dx: int, dy: int) -> Layout:
 
 def run_search(
     patio_full: Patio,
-    patio_inner: Patio,
+    inner: InnerRect,
     slabs: Sequence[SlabType],
     joint_mm: int,
     num_solutions: int,
+    coverage_target: float,
     beam_width: int,
     time_limit_seconds: float,
     rng: random.Random,
@@ -554,12 +605,21 @@ def run_search(
     seen_signatures: Set[Tuple[Tuple[str, int, int, bool], ...]] = set()
     attempt = 0
 
-    while len(pool) < max(num_solutions * 2, beam_width) and (time.time() - start) < time_limit_seconds:
+    best_coverage = 0.0
+    while (time.time() - start) < time_limit_seconds:
         attempt += 1
-        candidate = construct_layout(patio_inner, slabs, joint_mm, rng)
-        candidate = improve_layout(candidate, patio_inner, slabs, joint_mm, rng, iterations=40)
-        scored = score_layout(candidate, patio_inner, slabs)
+        candidate, stats = construct_layout(inner, slabs, joint_mm, rng)
+        candidate = improve_layout(candidate, inner, slabs, joint_mm, rng, iterations=40)
+        scored = score_layout(candidate, Patio(inner.width_mm, inner.depth_mm), slabs)
         sig = tuple(sorted((p.slab, p.x_mm, p.y_mm, p.rotated) for p in candidate.placements))
+        elapsed = time.time() - start
+        if stats.end_reason == "unknown":
+            stats.end_reason = "search_iteration_complete"
+        print(
+            f"[debug] attempt={attempt:4d} end_reason={stats.end_reason} tried={stats.attempted_placements} "
+            f"frontier_failures={stats.frontier_failures} blocked_cells={stats.blocked_cells} elapsed={elapsed:.2f}s",
+            flush=True,
+        )
         if sig not in seen_signatures:
             seen_signatures.add(sig)
             pool.append((candidate, scored))
@@ -567,19 +627,20 @@ def run_search(
             if len(pool) > beam_width:
                 pool = pool[:beam_width]
             best = pool[0][1]
+            best_coverage = max(best_coverage, best.coverage_ratio)
             print(
                 f"[progress] attempt={attempt:4d} pool={len(pool):3d} best_score={best.score_total:9.2f} "
                 f"coverage={best.coverage_ratio*100:6.2f}% long={best.max_long_line_mm:4d} cross={best.cross_count:3d}",
                 flush=True,
             )
+        if best_coverage >= coverage_target and len(pool) >= num_solutions:
+            break
 
     pool.sort(key=lambda t: t[1].score_total, reverse=True)
     best_n = pool[:num_solutions]
     shifted_out: List[Tuple[Layout, ScoreBreakdown]] = []
-    dx = (patio_full.width_mm - patio_inner.width_mm) // 2
-    dy = (patio_full.depth_mm - patio_inner.depth_mm) // 2
     for layout, score in best_n:
-        shifted_layout = shift_layout(layout, dx, dy)
+        shifted_layout = shift_layout(layout, 0, 0)
         shifted_score = score_layout(shifted_layout, patio_full, slabs)
         shifted_out.append((shifted_layout, shifted_score))
     return shifted_out
@@ -624,23 +685,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     input_path = Path(args.input_json)
-    patio_full, joint_mm, wall_gap_mm, slabs, num_solutions, seed = parse_input(input_path)
+    patio_full, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, num_solutions, coverage_target, seed = parse_input(input_path)
 
     rng = random.Random(seed)
-    patio_inner = apply_wall_gap(patio_full, wall_gap_mm)
+    inner = compute_inner_rect(patio_full, wall_gap_mm, perimeter_gap_mm)
 
     print(
-        f"Starting search: patio={patio_full.width_mm}x{patio_full.depth_mm}mm inner={patio_inner.width_mm}x{patio_inner.depth_mm}mm "
+        f"Starting search: patio={patio_full.width_mm}x{patio_full.depth_mm}mm inner={inner.width_mm}x{inner.depth_mm}mm "
         f"slabs={len(slabs)} target_solutions={num_solutions} seed={seed}",
         flush=True,
     )
 
     results = run_search(
         patio_full=patio_full,
-        patio_inner=patio_inner,
+        inner=inner,
         slabs=slabs,
         joint_mm=joint_mm,
         num_solutions=num_solutions,
+        coverage_target=coverage_target,
         beam_width=max(2, args.beam_width),
         time_limit_seconds=max(1.0, args.time_limit_seconds),
         rng=rng,
