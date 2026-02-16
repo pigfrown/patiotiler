@@ -93,6 +93,16 @@ class FillStats:
     end_reason: str = "unknown"
 
 
+@dataclass(frozen=True)
+class PlacementPolicy:
+    strategy: str
+    slab_weights: Dict[str, float]
+    min_remaining_ratio_for_small: float
+    late_stage_small_bonus: float
+    small_slab_names: Set[str]
+    small_area_threshold: int
+
+
 class OccupancyGrid:
     def __init__(self, width_mm: int, depth_mm: int, grid_mm: int = GRID_MM):
         self.grid_mm = grid_mm
@@ -310,27 +320,125 @@ def build_candidate_placements(
     slabs: Sequence[SlabType],
     layout: Layout,
     occ: OccupancyGrid,
-    rng: random.Random,
 ) -> List[Placement]:
     out: List[Placement] = []
     x_limit = inner.x0_mm + inner.width_mm
     y_limit = inner.y0_mm + inner.depth_mm
 
-    slab_order = list(slabs)
-    rng.shuffle(slab_order)
-
-    for slab in slab_order:
+    for slab in slabs:
         if layout.used_counts.get(slab.name, 0) >= slab.count_available:
             continue
-        orientations = slab.orientations()
-        rng.shuffle(orientations)
-        for w, h, rotated in orientations:
+        for w, h, rotated in slab.orientations():
             if x + w > x_limit or y + h > y_limit:
                 continue
             cand = Placement(slab=slab.name, x_mm=x, y_mm=y, w_mm=w, h_mm=h, rotated=rotated)
             if occ.is_free(x, y, w, h) and has_joint_clearance(cand, layout.placements, joint_mm):
                 out.append(cand)
     return out
+
+
+def compute_contact_score(candidate: Placement, occ: OccupancyGrid, inner: InnerRect) -> float:
+    c0 = (candidate.x_mm - inner.x0_mm) // GRID_MM
+    c1 = c0 + candidate.w_mm // GRID_MM
+    r0 = (candidate.y_mm - inner.y0_mm) // GRID_MM
+    r1 = r0 + candidate.h_mm // GRID_MM
+
+    score = 0.0
+
+    if c0 == 0:
+        score += (r1 - r0)
+    elif c0 > 0:
+        left_col = c0 - 1
+        for r in range(r0, r1):
+            if occ.bits[r] & (1 << left_col):
+                score += 1.0
+
+    if c1 == occ.cols:
+        score += (r1 - r0)
+    elif c1 < occ.cols:
+        right_col = c1
+        for r in range(r0, r1):
+            if occ.bits[r] & (1 << right_col):
+                score += 1.0
+
+    if r0 == 0:
+        score += (c1 - c0)
+    elif r0 > 0:
+        top_row = r0 - 1
+        mask = occ._mask(c0, c1)
+        score += (occ.bits[top_row] & mask).bit_count()
+
+    if r1 == occ.rows:
+        score += (c1 - c0)
+    elif r1 < occ.rows:
+        bottom_row = r1
+        mask = occ._mask(c0, c1)
+        score += (occ.bits[bottom_row] & mask).bit_count()
+
+    return score
+
+
+def choose_candidate(
+    cands: Sequence[Placement],
+    layout: Layout,
+    slabs: Sequence[SlabType],
+    occ: OccupancyGrid,
+    inner: InnerRect,
+    policy: PlacementPolicy,
+    rng: random.Random,
+) -> Placement:
+    slab_by_name = {s.name: s for s in slabs}
+    remaining_free_fraction = 1.0 - (sum(p.area for p in layout.placements) / (inner.width_mm * inner.depth_mm))
+
+    def is_small(c: Placement) -> bool:
+        return c.slab in policy.small_slab_names or c.area <= policy.small_area_threshold
+
+    large = [c for c in cands if not is_small(c)]
+    allowed = cands
+    if remaining_free_fraction > policy.min_remaining_ratio_for_small and large:
+        allowed = large
+
+    def slab_weight(c: Placement) -> float:
+        return max(0.01, policy.slab_weights.get(c.slab, 1.0))
+
+    def balanced_factor(c: Placement) -> float:
+        slab = slab_by_name[c.slab]
+        used = layout.used_counts.get(c.slab, 0)
+        remaining = max(0, slab.count_available - used)
+        return 0.25 + (remaining / max(1, slab.count_available))
+
+    if policy.strategy == "largest_first":
+        return max(
+            allowed,
+            key=lambda c: (
+                c.area,
+                max(c.w_mm, c.h_mm),
+                compute_contact_score(c, occ, inner),
+                slab_weight(c),
+                -c.y_mm,
+                -c.x_mm,
+            ),
+        )
+
+    weighted: List[Tuple[float, Placement]] = []
+    for c in allowed:
+        weight = slab_weight(c) * c.area
+        contact = compute_contact_score(c, occ, inner)
+        weight *= 1.0 + 0.08 * contact
+        if policy.strategy == "balanced":
+            weight *= balanced_factor(c)
+        if remaining_free_fraction <= policy.min_remaining_ratio_for_small and is_small(c):
+            weight *= max(0.01, policy.late_stage_small_bonus)
+        weighted.append((max(0.001, weight), c))
+
+    total = sum(w for w, _ in weighted)
+    pick = rng.uniform(0.0, total)
+    run = 0.0
+    for w, c in weighted:
+        run += w
+        if run >= pick:
+            return c
+    return weighted[-1][1]
 
 
 def placement_delta_score(layout: Layout, placement: Placement, patio: Patio, slab_types: Sequence[SlabType]) -> float:
@@ -344,6 +452,7 @@ def construct_layout(
     inner: InnerRect,
     slabs: Sequence[SlabType],
     joint_mm: int,
+    policy: PlacementPolicy,
     rng: random.Random,
     max_steps: Optional[int] = None,
 ) -> Tuple[Layout, FillStats]:
@@ -363,24 +472,15 @@ def construct_layout(
         lx, ly = frontier
         x = inner.x0_mm + lx
         y = inner.y0_mm + ly
-        cands = build_candidate_placements(x, y, inner, joint_mm, slabs, layout, occ, rng)
+        cands = build_candidate_placements(x, y, inner, joint_mm, slabs, layout, occ)
         if not cands:
             occ.set_rect(lx, ly, GRID_MM, GRID_MM, True)
             stats.frontier_failures += 1
             stats.blocked_cells += 1
             continue
 
-        weighted: List[Tuple[float, Placement]] = []
-        for c in cands:
-            base = c.area
-            jitter = rng.uniform(0.9, 1.15)
-            score = placement_delta_score(layout, c, Patio(inner.width_mm, inner.depth_mm), slabs)
-            weighted.append((base * jitter + 0.001 * score, c))
-            stats.attempted_placements += 1
-
-        weighted.sort(key=lambda t: t[0], reverse=True)
-        top = weighted[: min(4, len(weighted))]
-        pick = rng.choice(top)[1]
+        stats.attempted_placements += len(cands)
+        pick = choose_candidate(cands, layout, slabs, occ, inner, policy, rng)
 
         layout.placements.append(pick)
         layout.used_counts[pick.slab] += 1
@@ -397,6 +497,7 @@ def improve_layout(
     inner: InnerRect,
     slabs: Sequence[SlabType],
     joint_mm: int,
+    policy: PlacementPolicy,
     rng: random.Random,
     iterations: int = 60,
 ) -> Layout:
@@ -427,11 +528,11 @@ def improve_layout(
             lx, ly = frontier
             x = inner.x0_mm + lx
             y = inner.y0_mm + ly
-            cands = build_candidate_placements(x, y, inner, joint_mm, slabs, candidate, occ, rng)
+            cands = build_candidate_placements(x, y, inner, joint_mm, slabs, candidate, occ)
             if not cands:
                 occ.set_rect(lx, ly, GRID_MM, GRID_MM, True)
                 continue
-            pick = max(cands, key=lambda c: c.area + rng.uniform(0, 2000))
+            pick = choose_candidate(cands, candidate, slabs, occ, inner, policy, rng)
             candidate.placements.append(pick)
             candidate.used_counts[pick.slab] += 1
             occ.set_rect(pick.x_mm - inner.x0_mm, pick.y_mm - inner.y0_mm, pick.w_mm, pick.h_mm, True)
@@ -445,11 +546,13 @@ def improve_layout(
     return current
 
 
-def layout_to_json(layout: Layout, score: ScoreBreakdown) -> Dict[str, object]:
+def layout_to_json(layout: Layout, score: ScoreBreakdown, slabs: Sequence[SlabType], policy: PlacementPolicy) -> Dict[str, object]:
     counts: Dict[str, int] = defaultdict(int)
+    area_by_slab: Dict[str, int] = defaultdict(int)
     placements = []
     for p in layout.placements:
         counts[p.slab] += 1
+        area_by_slab[p.slab] += p.area
         placements.append(
             {
                 "slab": p.slab,
@@ -458,11 +561,27 @@ def layout_to_json(layout: Layout, score: ScoreBreakdown) -> Dict[str, object]:
                 "rotated": bool(p.rotated),
             }
         )
+    counts_remaining = {s.name: max(0, s.count_available - counts.get(s.name, 0)) for s in slabs}
+    total_area = sum(p.area for p in layout.placements)
+    area_percent_by_slab = {
+        s.name: round((area_by_slab.get(s.name, 0) / total_area) * 100.0, 3) if total_area > 0 else 0.0 for s in slabs
+    }
+
     return {
         "placements": placements,
         "summary": {
             "coverage_percent": round(score.coverage_ratio * 100.0, 3),
             "counts_used": dict(sorted(counts.items())),
+            "counts_remaining": dict(sorted(counts_remaining.items())),
+            "area_percent_by_slab": dict(sorted(area_percent_by_slab.items())),
+            "policy_used": {
+                "strategy": policy.strategy,
+                "slab_weights": {s.name: policy.slab_weights.get(s.name, 1.0) for s in slabs},
+                "min_remaining_ratio_for_small": policy.min_remaining_ratio_for_small,
+                "late_stage_small_bonus": policy.late_stage_small_bonus,
+                "small_slab_names": sorted(policy.small_slab_names),
+                "small_area_threshold": policy.small_area_threshold,
+            },
             "score_total": round(score.score_total, 3),
             "score_breakdown": {
                 "coverage_score": round(score.coverage_score, 3),
@@ -541,7 +660,52 @@ def write_svg(path: Path, patio: Patio, placements: Sequence[Placement], wall_ga
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def parse_input(path: Path) -> Tuple[Patio, int, int, int, List[SlabType], int, float, Optional[int]]:
+def resolve_policy(data: Dict[str, object], slabs: Sequence[SlabType]) -> PlacementPolicy:
+    placement_policy = data.get("placement_policy", {})
+    if not isinstance(placement_policy, dict):
+        placement_policy = {}
+
+    strategy = str(placement_policy.get("strategy", "largest_first")).strip().lower()
+    if strategy not in {"largest_first", "weighted", "balanced"}:
+        strategy = "largest_first"
+
+    default_weights = {}
+    area_sorted = sorted(slabs, key=lambda s: s.w_mm * s.h_mm, reverse=True)
+    max_rank = max(1, len(area_sorted) - 1)
+    for idx, s in enumerate(area_sorted):
+        default_weights[s.name] = 1.0 + 4.0 * (max_rank - idx) / max_rank
+
+    slab_weights_in = placement_policy.get("slab_weights", {})
+    slab_weights = dict(default_weights)
+    if isinstance(slab_weights_in, dict):
+        for name, value in slab_weights_in.items():
+            try:
+                slab_weights[str(name)] = max(0.01, float(value))
+            except (TypeError, ValueError):
+                continue
+
+    min_ratio = float(placement_policy.get("min_remaining_ratio_for_small", 0.20))
+    min_ratio = min(0.95, max(0.0, min_ratio))
+    late_bonus = max(0.01, float(placement_policy.get("late_stage_small_bonus", 2.0)))
+
+    by_area = sorted({s.w_mm * s.h_mm for s in slabs})
+    small_area_threshold = by_area[1] if len(by_area) > 1 else by_area[0]
+    small_names = {s.name for s in slabs if (s.w_mm * s.h_mm) <= small_area_threshold}
+    for s in slabs:
+        if s.name in {"290x290", "600x290"}:
+            small_names.add(s.name)
+
+    return PlacementPolicy(
+        strategy=strategy,
+        slab_weights=slab_weights,
+        min_remaining_ratio_for_small=min_ratio,
+        late_stage_small_bonus=late_bonus,
+        small_slab_names=small_names,
+        small_area_threshold=small_area_threshold,
+    )
+
+
+def parse_input(path: Path) -> Tuple[Patio, int, int, int, List[SlabType], PlacementPolicy, int, float, Optional[int]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     patio_raw = data["patio"]
     patio = Patio(
@@ -564,10 +728,12 @@ def parse_input(path: Path) -> Tuple[Patio, int, int, int, List[SlabType], int, 
     if not slabs:
         raise ValueError("No slab types with positive count were provided")
 
+    policy = resolve_policy(data, slabs)
+
     num_solutions = max(1, int(data.get("num_solutions", 10)))
     coverage_target = float(data.get("coverage_target", 0.95))
     seed = data.get("seed")
-    return patio, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, num_solutions, coverage_target, (int(seed) if seed is not None else None)
+    return patio, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, policy, num_solutions, coverage_target, (int(seed) if seed is not None else None)
 
 
 def compute_inner_rect(patio: Patio, wall_gap_mm: int, perimeter_gap_mm: int) -> InnerRect:
@@ -593,6 +759,7 @@ def run_search(
     patio_full: Patio,
     inner: InnerRect,
     slabs: Sequence[SlabType],
+    policy: PlacementPolicy,
     joint_mm: int,
     num_solutions: int,
     coverage_target: float,
@@ -608,8 +775,8 @@ def run_search(
     best_coverage = 0.0
     while (time.time() - start) < time_limit_seconds:
         attempt += 1
-        candidate, stats = construct_layout(inner, slabs, joint_mm, rng)
-        candidate = improve_layout(candidate, inner, slabs, joint_mm, rng, iterations=40)
+        candidate, stats = construct_layout(inner, slabs, joint_mm, policy, rng)
+        candidate = improve_layout(candidate, inner, slabs, joint_mm, policy, rng, iterations=40)
         scored = score_layout(candidate, Patio(inner.width_mm, inner.depth_mm), slabs)
         sig = tuple(sorted((p.slab, p.x_mm, p.y_mm, p.rotated) for p in candidate.placements))
         elapsed = time.time() - start
@@ -652,23 +819,23 @@ def write_outputs(
     wall_gap_mm: int,
     joint_mm: int,
     results: Sequence[Tuple[Layout, ScoreBreakdown]],
+    slabs: Sequence[SlabType],
+    policy: PlacementPolicy,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_lines = []
 
     for idx, (layout, score) in enumerate(results, start=1):
-        json_obj = layout_to_json(layout, score)
+        json_obj = layout_to_json(layout, score, slabs, policy)
         json_path = out_dir / f"layout_{idx}.json"
         svg_path = out_dir / f"layout_{idx}.svg"
         json_path.write_text(json.dumps(json_obj, indent=2), encoding="utf-8")
         write_svg(svg_path, patio, layout.placements, wall_gap_mm, joint_mm)
 
         summary_lines.append(
-            (
-                f"Layout {idx}: score={score.score_total:.2f} coverage={score.coverage_ratio*100:.2f}% "
-                f"long_line_pen={score.long_line_penalty:.2f} max_line={score.max_long_line_mm}mm "
-                f"cross={score.cross_count} t_junctions={score.t_junction_count}\n"
-            )
+            f"Layout {idx}: score={score.score_total:.2f} coverage={score.coverage_ratio*100:.2f}% "
+            f"long_line_pen={score.long_line_penalty:.2f} max_line={score.max_long_line_mm}mm "
+            f"cross={score.cross_count} t_junctions={score.t_junction_count} policy={policy.strategy}\n"
         )
 
     (out_dir / "summary.txt").write_text("".join(summary_lines), encoding="utf-8")
@@ -685,14 +852,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     input_path = Path(args.input_json)
-    patio_full, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, num_solutions, coverage_target, seed = parse_input(input_path)
+    patio_full, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, policy, num_solutions, coverage_target, seed = parse_input(input_path)
 
     rng = random.Random(seed)
     inner = compute_inner_rect(patio_full, wall_gap_mm, perimeter_gap_mm)
 
     print(
         f"Starting search: patio={patio_full.width_mm}x{patio_full.depth_mm}mm inner={inner.width_mm}x{inner.depth_mm}mm "
-        f"slabs={len(slabs)} target_solutions={num_solutions} seed={seed}",
+        f"slabs={len(slabs)} target_solutions={num_solutions} seed={seed} strategy={policy.strategy}",
         flush=True,
     )
 
@@ -700,6 +867,7 @@ def main() -> None:
         patio_full=patio_full,
         inner=inner,
         slabs=slabs,
+        policy=policy,
         joint_mm=joint_mm,
         num_solutions=num_solutions,
         coverage_target=coverage_target,
@@ -711,7 +879,7 @@ def main() -> None:
     if not results:
         raise RuntimeError("No layouts generated within time limit")
 
-    write_outputs(Path("out"), patio_full, wall_gap_mm, joint_mm, results)
+    write_outputs(Path("out"), patio_full, wall_gap_mm, joint_mm, results, slabs, policy)
     print(f"Wrote {len(results)} layouts to out/", flush=True)
 
 
@@ -740,7 +908,18 @@ Input JSON example
     { "name": "290x290", "w_mm": 290, "h_mm": 290, "count": 40 }
   ],
   "num_solutions": 10,
-  "seed": 123
+  "seed": 123,
+  "placement_policy": {
+    "strategy": "largest_first",
+    "slab_weights": {
+      "900x600": 5.0,
+      "600x600": 4.0,
+      "600x290": 2.0,
+      "290x290": 1.0
+    },
+    "min_remaining_ratio_for_small": 0.20,
+    "late_stage_small_bonus": 2.0
+  }
 }
 
 Outputs
