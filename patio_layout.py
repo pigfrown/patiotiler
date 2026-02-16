@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import random
@@ -13,6 +14,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 GRID_MM = 10
 LONG_LINE_THRESHOLD_MM = 1200
+MAX_ALLOWED_LONG_LINE_MM = 1800
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,7 @@ class ScoreBreakdown:
     max_long_line_mm: int
     cross_count: int
     t_junction_count: int
+    seams_over_threshold: int
 
 
 @dataclass
@@ -101,6 +104,23 @@ class PlacementPolicy:
     late_stage_small_bonus: float
     small_slab_names: Set[str]
     small_area_threshold: int
+
+
+@dataclass(frozen=True)
+class AntiPatternConfig:
+    long_line_threshold_mm: int = LONG_LINE_THRESHOLD_MM
+    max_allowed_long_line_mm: int = MAX_ALLOWED_LONG_LINE_MM
+    cross_reject: bool = True
+    cross_reject_free_area_below: float = 0.08
+    long_line_reject: bool = True
+    long_line_reject_free_area_below: float = 0.10
+    cross_penalty: float = 5000.0
+    t_junction_penalty: float = 150.0
+    long_line_penalty_factor: float = 1.0
+    long_line_weight: float = 40.0
+    uncovered_proxy_weight: float = 120.0
+    contact_weight: float = 6.0
+    stagger_bonus_weight: float = 50.0
 
 
 class OccupancyGrid:
@@ -165,7 +185,7 @@ def validate_dim(name: str, value: int) -> int:
     return clamp_to_grid(value)
 
 
-def long_line_penalty(placements: Sequence[Placement], patio_w: int, patio_h: int, threshold: int) -> Tuple[float, int]:
+def long_line_penalty(placements: Sequence[Placement], patio_w: int, patio_h: int, threshold: int) -> Tuple[float, int, int]:
     vertical_by_x: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
     horizontal_by_y: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
 
@@ -190,6 +210,7 @@ def long_line_penalty(placements: Sequence[Placement], patio_w: int, patio_h: in
 
     max_len = 0
     penalty = 0.0
+    over_count = 0
 
     for x, spans in vertical_by_x.items():
         if x <= 0 or x >= patio_w:
@@ -199,7 +220,8 @@ def long_line_penalty(placements: Sequence[Placement], patio_w: int, patio_h: in
             max_len = max(max_len, length)
             if length > threshold:
                 over = length - threshold
-                penalty += over * 0.025
+                penalty += ((over / 100.0) ** 2)
+                over_count += 1
 
     for y, spans in horizontal_by_y.items():
         if y <= 0 or y >= patio_h:
@@ -209,9 +231,10 @@ def long_line_penalty(placements: Sequence[Placement], patio_w: int, patio_h: in
             max_len = max(max_len, length)
             if length > threshold:
                 over = length - threshold
-                penalty += over * 0.025
+                penalty += ((over / 100.0) ** 2)
+                over_count += 1
 
-    return penalty, max_len
+    return penalty, max_len, over_count
 
 
 def corner_and_t_penalties(placements: Sequence[Placement], patio_w: int, patio_h: int) -> Tuple[int, int]:
@@ -258,12 +281,189 @@ def corner_and_t_penalties(placements: Sequence[Placement], patio_w: int, patio_
     return cross, t_count
 
 
-def score_layout(layout: Layout, patio: Patio, slab_types: Sequence[SlabType]) -> ScoreBreakdown:
+@dataclass
+class CandidateEval:
+    placement: Placement
+    placement_score: float
+    delta_long_line: float
+    delta_cross: int
+    delta_t_junction: int
+    stagger_bonus: float
+    creates_cross: bool
+    max_line_after_mm: int
+
+
+class PatternState:
+    def __init__(self, patio_w: int, patio_h: int, anti: AntiPatternConfig):
+        self.patio_w = patio_w
+        self.patio_h = patio_h
+        self.anti = anti
+        self.next_slab_id = 0
+        self.corner_map: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
+        self.edges_v: Dict[int, List[Tuple[int, int, int]]] = defaultdict(list)
+        self.edges_h: Dict[int, List[Tuple[int, int, int]]] = defaultdict(list)
+        self.seams_v: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        self.seams_h: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+
+    def _is_interior(self, x: int, y: int) -> bool:
+        return 0 < x < self.patio_w and 0 < y < self.patio_h
+
+    def _line_penalty(self, length: int) -> float:
+        if length <= self.anti.long_line_threshold_mm:
+            return 0.0
+        over = length - self.anti.long_line_threshold_mm
+        return self.anti.long_line_penalty_factor * ((over / 100.0) ** 2)
+
+    def _line_total_penalty(self, intervals: Sequence[Tuple[int, int]]) -> float:
+        return sum(self._line_penalty(b - a) for a, b in intervals)
+
+    def _preview_add_interval(self, intervals: Sequence[Tuple[int, int]], a: int, b: int) -> List[Tuple[int, int]]:
+        if not intervals:
+            return [(a, b)]
+        starts = [x for x, _ in intervals]
+        i = bisect.bisect_left(starts, a)
+        merged: List[Tuple[int, int]] = list(intervals)
+        left = i
+        if left > 0 and merged[left - 1][1] >= a:
+            left -= 1
+        na, nb = a, b
+        right = left
+        while right < len(merged) and merged[right][0] <= nb:
+            na = min(na, merged[right][0])
+            nb = max(nb, merged[right][1])
+            right += 1
+        return merged[:left] + [(na, nb)] + merged[right:]
+
+    def _max_interval_len(self, intervals: Sequence[Tuple[int, int]]) -> int:
+        if not intervals:
+            return 0
+        return max(b - a for a, b in intervals)
+
+    def _overlap_len(self, intervals: Sequence[Tuple[int, int]], a: int, b: int) -> int:
+        overlap = 0
+        for ia, ib in intervals:
+            if ib <= a:
+                continue
+            if ia >= b:
+                break
+            overlap += max(0, min(ib, b) - max(ia, a))
+        return overlap
+
+    def evaluate_candidate(self, candidate: Placement, occ: OccupancyGrid, inner: InnerRect, filled_area: int) -> CandidateEval:
+        x0 = candidate.x_mm - inner.x0_mm
+        y0 = candidate.y_mm - inner.y0_mm
+        x1 = x0 + candidate.w_mm
+        y1 = y0 + candidate.h_mm
+
+        delta_cross = 0
+        delta_t = 0
+        corner_points = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+        for x, y in corner_points:
+            existing = self.corner_map.get((x, y), set())
+            new_count = len(existing) + 1
+            if self._is_interior(x, y) and new_count >= 4:
+                delta_cross += 1
+                continue
+            if self._is_interior(x, y) and new_count >= 2:
+                has_t = False
+                for a, b, sid in self.edges_v.get(x, []):
+                    if sid in existing:
+                        continue
+                    if a < y < b:
+                        has_t = True
+                        break
+                if not has_t:
+                    for a, b, sid in self.edges_h.get(y, []):
+                        if sid in existing:
+                            continue
+                        if a < x < b:
+                            has_t = True
+                            break
+                if has_t:
+                    delta_t += 1
+
+        delta_long = 0.0
+        max_line_after = 0
+        v_edges = [(x0, y0, y1), (x1, y0, y1)]
+        h_edges = [(y0, x0, x1), (y1, x0, x1)]
+        for x, a, b in v_edges:
+            if x <= 0 or x >= self.patio_w:
+                continue
+            old = self.seams_v.get(x, [])
+            new = self._preview_add_interval(old, a, b)
+            delta_long += self._line_total_penalty(new) - self._line_total_penalty(old)
+            max_line_after = max(max_line_after, self._max_interval_len(new))
+        for y, a, b in h_edges:
+            if y <= 0 or y >= self.patio_h:
+                continue
+            old = self.seams_h.get(y, [])
+            new = self._preview_add_interval(old, a, b)
+            delta_long += self._line_total_penalty(new) - self._line_total_penalty(old)
+            max_line_after = max(max_line_after, self._max_interval_len(new))
+
+        stagger_bonus = 0.0
+        for x, a, b in v_edges:
+            if x <= 0 or x >= self.patio_w:
+                continue
+            old = self.seams_v.get(x, [])
+            overlap = self._overlap_len(old, a, b)
+            if overlap > 0:
+                stagger_bonus -= overlap / 100.0
+            else:
+                stagger_bonus += max(0.5, (b - a) / 250.0)
+
+        contact = compute_contact_score(candidate, occ, inner)
+        patio_area = self.patio_w * self.patio_h
+        delta_uncovered_proxy = (candidate.area / patio_area) if patio_area else 0.0
+        placement_score = (
+            candidate.area
+            - self.anti.uncovered_proxy_weight * delta_uncovered_proxy
+            - self.anti.long_line_weight * delta_long
+            - self.anti.cross_penalty * delta_cross
+            - self.anti.t_junction_penalty * delta_t
+            + self.anti.contact_weight * contact
+            + self.anti.stagger_bonus_weight * stagger_bonus
+        )
+        return CandidateEval(
+            placement=candidate,
+            placement_score=placement_score,
+            delta_long_line=delta_long,
+            delta_cross=delta_cross,
+            delta_t_junction=delta_t,
+            stagger_bonus=stagger_bonus,
+            creates_cross=delta_cross > 0,
+            max_line_after_mm=max_line_after,
+        )
+
+    def commit(self, placement: Placement, inner: InnerRect) -> None:
+        x0 = placement.x_mm - inner.x0_mm
+        y0 = placement.y_mm - inner.y0_mm
+        x1 = x0 + placement.w_mm
+        y1 = y0 + placement.h_mm
+        sid = self.next_slab_id
+        self.next_slab_id += 1
+        for pt in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]:
+            self.corner_map[pt].add(sid)
+        self.edges_v[x0].append((y0, y1, sid))
+        self.edges_v[x1].append((y0, y1, sid))
+        self.edges_h[y0].append((x0, x1, sid))
+        self.edges_h[y1].append((x0, x1, sid))
+        if 0 < x0 < self.patio_w:
+            self.seams_v[x0] = self._preview_add_interval(self.seams_v.get(x0, []), y0, y1)
+        if 0 < x1 < self.patio_w:
+            self.seams_v[x1] = self._preview_add_interval(self.seams_v.get(x1, []), y0, y1)
+        if 0 < y0 < self.patio_h:
+            self.seams_h[y0] = self._preview_add_interval(self.seams_h.get(y0, []), x0, x1)
+        if 0 < y1 < self.patio_h:
+            self.seams_h[y1] = self._preview_add_interval(self.seams_h.get(y1, []), x0, x1)
+
+
+def score_layout(layout: Layout, patio: Patio, slab_types: Sequence[SlabType], anti: AntiPatternConfig) -> ScoreBreakdown:
     patio_area = patio.width_mm * patio.depth_mm
     covered = sum(p.area for p in layout.placements)
     coverage_ratio = covered / patio_area if patio_area else 0.0
 
-    long_pen, max_line = long_line_penalty(layout.placements, patio.width_mm, patio.depth_mm, LONG_LINE_THRESHOLD_MM)
+    long_pen, max_line, over_count = long_line_penalty(layout.placements, patio.width_mm, patio.depth_mm, anti.long_line_threshold_mm)
     cross_count, t_count = corner_and_t_penalties(layout.placements, patio.width_mm, patio.depth_mm)
 
     counts = [layout.used_counts.get(s.name, 0) for s in slab_types]
@@ -276,13 +476,12 @@ def score_layout(layout: Layout, patio: Patio, slab_types: Sequence[SlabType]) -
     else:
         variety_pen = 50.0
 
-    # Coverage is the primary objective; pattern penalties are secondary tie-breakers.
-    coverage_score = coverage_ratio * 30000.0
-    uncovered_penalty = (1.0 - coverage_ratio) * 10000.0
-    cross_penalty = cross_count * 220.0
-    t_penalty = t_count * 20.0
+    coverage_score = coverage_ratio * 50000.0
+    uncovered_penalty = (1.0 - coverage_ratio) * 30000.0
+    cross_penalty = cross_count * anti.cross_penalty
+    t_penalty = t_count * anti.t_junction_penalty
 
-    total = coverage_score - uncovered_penalty - 0.75 * long_pen - cross_penalty - t_penalty - 0.35 * variety_pen
+    total = coverage_score - uncovered_penalty - 6.0 * long_pen - cross_penalty - t_penalty - 0.35 * variety_pen
 
     return ScoreBreakdown(
         score_total=total,
@@ -296,6 +495,7 @@ def score_layout(layout: Layout, patio: Patio, slab_types: Sequence[SlabType]) -
         max_long_line_mm=max_line,
         cross_count=cross_count,
         t_junction_count=t_count,
+        seams_over_threshold=over_count,
     )
 
 
@@ -385,18 +585,36 @@ def choose_candidate(
     occ: OccupancyGrid,
     inner: InnerRect,
     policy: PlacementPolicy,
+    anti: AntiPatternConfig,
+    pattern_state: PatternState,
     rng: random.Random,
 ) -> Placement:
     slab_by_name = {s.name: s for s in slabs}
-    remaining_free_fraction = 1.0 - (sum(p.area for p in layout.placements) / (inner.width_mm * inner.depth_mm))
+    total_area = inner.width_mm * inner.depth_mm
+    filled_area = sum(p.area for p in layout.placements)
+    remaining_free_fraction = 1.0 - (filled_area / total_area if total_area else 0.0)
 
     def is_small(c: Placement) -> bool:
         return c.slab in policy.small_slab_names or c.area <= policy.small_area_threshold
 
     large = [c for c in cands if not is_small(c)]
-    allowed = cands
+    prefiltered = list(cands)
     if remaining_free_fraction > policy.min_remaining_ratio_for_small and large:
-        allowed = large
+        prefiltered = large
+
+    evals: List[CandidateEval] = [pattern_state.evaluate_candidate(c, occ, inner, filled_area) for c in prefiltered]
+
+    enforce_cross = anti.cross_reject and remaining_free_fraction > anti.cross_reject_free_area_below
+    enforce_long = anti.long_line_reject and remaining_free_fraction > anti.long_line_reject_free_area_below
+
+    filtered = [
+        ev
+        for ev in evals
+        if (not enforce_cross or not ev.creates_cross)
+        and (not enforce_long or ev.max_line_after_mm <= anti.max_allowed_long_line_mm)
+    ]
+    if not filtered:
+        filtered = evals
 
     def slab_weight(c: Placement) -> float:
         return max(0.01, policy.slab_weights.get(c.slab, 1.0))
@@ -408,23 +626,22 @@ def choose_candidate(
         return 0.25 + (remaining / max(1, slab.count_available))
 
     if policy.strategy == "largest_first":
-        return max(
-            allowed,
-            key=lambda c: (
-                c.area,
-                max(c.w_mm, c.h_mm),
-                compute_contact_score(c, occ, inner),
-                slab_weight(c),
-                -c.y_mm,
-                -c.x_mm,
+        best = max(
+            filtered,
+            key=lambda ev: (
+                ev.placement_score,
+                ev.placement.area,
+                max(ev.placement.w_mm, ev.placement.h_mm),
+                -ev.placement.y_mm,
+                -ev.placement.x_mm,
             ),
         )
+        return best.placement
 
     weighted: List[Tuple[float, Placement]] = []
-    for c in allowed:
-        weight = slab_weight(c) * c.area
-        contact = compute_contact_score(c, occ, inner)
-        weight *= 1.0 + 0.08 * contact
+    for ev in filtered:
+        c = ev.placement
+        weight = slab_weight(c) * max(1.0, ev.placement_score)
         if policy.strategy == "balanced":
             weight *= balanced_factor(c)
         if remaining_free_fraction <= policy.min_remaining_ratio_for_small and is_small(c):
@@ -441,23 +658,18 @@ def choose_candidate(
     return weighted[-1][1]
 
 
-def placement_delta_score(layout: Layout, placement: Placement, patio: Patio, slab_types: Sequence[SlabType]) -> float:
-    trial = Layout(placements=layout.placements + [placement], used_counts=defaultdict(int, layout.used_counts))
-    trial.used_counts[placement.slab] += 1
-    scored = score_layout(trial, patio, slab_types)
-    return scored.score_total
-
-
 def construct_layout(
     inner: InnerRect,
     slabs: Sequence[SlabType],
     joint_mm: int,
     policy: PlacementPolicy,
+    anti: AntiPatternConfig,
     rng: random.Random,
     max_steps: Optional[int] = None,
 ) -> Tuple[Layout, FillStats]:
     occ = OccupancyGrid(inner.width_mm, inner.depth_mm)
     layout = Layout()
+    pattern_state = PatternState(inner.width_mm, inner.depth_mm, anti)
     stats = FillStats()
     if max_steps is None:
         max_steps = occ.rows * occ.cols + 1
@@ -480,11 +692,12 @@ def construct_layout(
             continue
 
         stats.attempted_placements += len(cands)
-        pick = choose_candidate(cands, layout, slabs, occ, inner, policy, rng)
+        pick = choose_candidate(cands, layout, slabs, occ, inner, policy, anti, pattern_state, rng)
 
         layout.placements.append(pick)
         layout.used_counts[pick.slab] += 1
         occ.set_rect(pick.x_mm - inner.x0_mm, pick.y_mm - inner.y0_mm, pick.w_mm, pick.h_mm, True)
+        pattern_state.commit(pick, inner)
 
     if steps >= max_steps and stats.end_reason == "unknown":
         stats.end_reason = "max_steps_reached"
@@ -498,12 +711,13 @@ def improve_layout(
     slabs: Sequence[SlabType],
     joint_mm: int,
     policy: PlacementPolicy,
+    anti: AntiPatternConfig,
     rng: random.Random,
     iterations: int = 60,
 ) -> Layout:
     current = Layout(list(base.placements), defaultdict(int, base.used_counts))
     patio = Patio(inner.width_mm, inner.depth_mm)
-    current_score = score_layout(current, patio, slabs).score_total
+    current_score = score_layout(current, patio, slabs, anti).score_total
 
     for i in range(iterations):
         if not current.placements:
@@ -516,8 +730,10 @@ def improve_layout(
             candidate.used_counts[p.slab] += 1
 
         occ = OccupancyGrid(inner.width_mm, inner.depth_mm)
+        pattern_state = PatternState(inner.width_mm, inner.depth_mm, anti)
         for p in kept:
             occ.set_rect(p.x_mm - inner.x0_mm, p.y_mm - inner.y0_mm, p.w_mm, p.h_mm, True)
+            pattern_state.commit(p, inner)
 
         refill_steps = 0
         while refill_steps < 2500:
@@ -532,12 +748,13 @@ def improve_layout(
             if not cands:
                 occ.set_rect(lx, ly, GRID_MM, GRID_MM, True)
                 continue
-            pick = choose_candidate(cands, candidate, slabs, occ, inner, policy, rng)
+            pick = choose_candidate(cands, candidate, slabs, occ, inner, policy, anti, pattern_state, rng)
             candidate.placements.append(pick)
             candidate.used_counts[pick.slab] += 1
             occ.set_rect(pick.x_mm - inner.x0_mm, pick.y_mm - inner.y0_mm, pick.w_mm, pick.h_mm, True)
+            pattern_state.commit(pick, inner)
 
-        cand_score = score_layout(candidate, patio, slabs).score_total
+        cand_score = score_layout(candidate, patio, slabs, anti).score_total
         temp = max(0.01, 1.0 - i / iterations)
         if cand_score > current_score or rng.random() < math.exp((cand_score - current_score) / (200.0 * temp)):
             current = candidate
@@ -546,7 +763,7 @@ def improve_layout(
     return current
 
 
-def layout_to_json(layout: Layout, score: ScoreBreakdown, slabs: Sequence[SlabType], policy: PlacementPolicy) -> Dict[str, object]:
+def layout_to_json(layout: Layout, score: ScoreBreakdown, slabs: Sequence[SlabType], policy: PlacementPolicy, anti: AntiPatternConfig) -> Dict[str, object]:
     counts: Dict[str, int] = defaultdict(int)
     area_by_slab: Dict[str, int] = defaultdict(int)
     placements = []
@@ -582,6 +799,17 @@ def layout_to_json(layout: Layout, score: ScoreBreakdown, slabs: Sequence[SlabTy
                 "small_slab_names": sorted(policy.small_slab_names),
                 "small_area_threshold": policy.small_area_threshold,
             },
+            "anti_pattern_used": {
+                "long_line_threshold_mm": anti.long_line_threshold_mm,
+                "max_allowed_long_line_mm": anti.max_allowed_long_line_mm,
+                "cross_reject": anti.cross_reject,
+                "cross_reject_free_area_below": anti.cross_reject_free_area_below,
+                "long_line_reject": anti.long_line_reject,
+                "long_line_reject_free_area_below": anti.long_line_reject_free_area_below,
+                "cross_penalty": anti.cross_penalty,
+                "t_junction_penalty": anti.t_junction_penalty,
+                "long_line_penalty_factor": anti.long_line_penalty_factor,
+            },
             "score_total": round(score.score_total, 3),
             "score_breakdown": {
                 "coverage_score": round(score.coverage_score, 3),
@@ -593,6 +821,7 @@ def layout_to_json(layout: Layout, score: ScoreBreakdown, slabs: Sequence[SlabTy
                 "max_long_line_mm": int(score.max_long_line_mm),
                 "cross_count": int(score.cross_count),
                 "t_junction_count": int(score.t_junction_count),
+                "seams_over_threshold": int(score.seams_over_threshold),
             },
         },
     }
@@ -705,7 +934,7 @@ def resolve_policy(data: Dict[str, object], slabs: Sequence[SlabType]) -> Placem
     )
 
 
-def parse_input(path: Path) -> Tuple[Patio, int, int, int, List[SlabType], PlacementPolicy, int, float, Optional[int]]:
+def parse_input(path: Path) -> Tuple[Patio, int, int, int, List[SlabType], PlacementPolicy, AntiPatternConfig, int, float, Optional[int]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     patio_raw = data["patio"]
     patio = Patio(
@@ -730,10 +959,25 @@ def parse_input(path: Path) -> Tuple[Patio, int, int, int, List[SlabType], Place
 
     policy = resolve_policy(data, slabs)
 
+    anti_raw = data.get("anti_pattern", {})
+    if not isinstance(anti_raw, dict):
+        anti_raw = {}
+    anti = AntiPatternConfig(
+        long_line_threshold_mm=max(100, int(anti_raw.get("long_line_threshold_mm", LONG_LINE_THRESHOLD_MM))),
+        max_allowed_long_line_mm=max(100, int(anti_raw.get("max_allowed_long_line_mm", MAX_ALLOWED_LONG_LINE_MM))),
+        cross_reject=bool(anti_raw.get("cross_reject", True)),
+        cross_reject_free_area_below=min(0.99, max(0.0, float(anti_raw.get("cross_reject_free_area_below", 0.08)))),
+        long_line_reject=bool(anti_raw.get("long_line_reject", True)),
+        long_line_reject_free_area_below=min(0.99, max(0.0, float(anti_raw.get("long_line_reject_free_area_below", 0.10)))),
+        cross_penalty=max(0.0, float(anti_raw.get("cross_penalty", 5000))),
+        t_junction_penalty=max(0.0, float(anti_raw.get("t_junction_penalty", 150))),
+        long_line_penalty_factor=max(0.01, float(anti_raw.get("long_line_penalty_factor", 1.0))),
+    )
+
     num_solutions = max(1, int(data.get("num_solutions", 10)))
     coverage_target = float(data.get("coverage_target", 0.95))
     seed = data.get("seed")
-    return patio, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, policy, num_solutions, coverage_target, (int(seed) if seed is not None else None)
+    return patio, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, policy, anti, num_solutions, coverage_target, (int(seed) if seed is not None else None)
 
 
 def compute_inner_rect(patio: Patio, wall_gap_mm: int, perimeter_gap_mm: int) -> InnerRect:
@@ -760,6 +1004,7 @@ def run_search(
     inner: InnerRect,
     slabs: Sequence[SlabType],
     policy: PlacementPolicy,
+    anti: AntiPatternConfig,
     joint_mm: int,
     num_solutions: int,
     coverage_target: float,
@@ -775,9 +1020,9 @@ def run_search(
     best_coverage = 0.0
     while (time.time() - start) < time_limit_seconds:
         attempt += 1
-        candidate, stats = construct_layout(inner, slabs, joint_mm, policy, rng)
-        candidate = improve_layout(candidate, inner, slabs, joint_mm, policy, rng, iterations=40)
-        scored = score_layout(candidate, Patio(inner.width_mm, inner.depth_mm), slabs)
+        candidate, stats = construct_layout(inner, slabs, joint_mm, policy, anti, rng)
+        candidate = improve_layout(candidate, inner, slabs, joint_mm, policy, anti, rng, iterations=40)
+        scored = score_layout(candidate, Patio(inner.width_mm, inner.depth_mm), slabs, anti)
         sig = tuple(sorted((p.slab, p.x_mm, p.y_mm, p.rotated) for p in candidate.placements))
         elapsed = time.time() - start
         if stats.end_reason == "unknown":
@@ -808,7 +1053,7 @@ def run_search(
     shifted_out: List[Tuple[Layout, ScoreBreakdown]] = []
     for layout, score in best_n:
         shifted_layout = shift_layout(layout, 0, 0)
-        shifted_score = score_layout(shifted_layout, patio_full, slabs)
+        shifted_score = score_layout(shifted_layout, patio_full, slabs, anti)
         shifted_out.append((shifted_layout, shifted_score))
     return shifted_out
 
@@ -821,12 +1066,13 @@ def write_outputs(
     results: Sequence[Tuple[Layout, ScoreBreakdown]],
     slabs: Sequence[SlabType],
     policy: PlacementPolicy,
+    anti: AntiPatternConfig,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     summary_lines = []
 
     for idx, (layout, score) in enumerate(results, start=1):
-        json_obj = layout_to_json(layout, score, slabs, policy)
+        json_obj = layout_to_json(layout, score, slabs, policy, anti)
         json_path = out_dir / f"layout_{idx}.json"
         svg_path = out_dir / f"layout_{idx}.svg"
         json_path.write_text(json.dumps(json_obj, indent=2), encoding="utf-8")
@@ -834,7 +1080,7 @@ def write_outputs(
 
         summary_lines.append(
             f"Layout {idx}: score={score.score_total:.2f} coverage={score.coverage_ratio*100:.2f}% "
-            f"long_line_pen={score.long_line_penalty:.2f} max_line={score.max_long_line_mm}mm "
+            f"long_line_pen={score.long_line_penalty:.2f} max_line={score.max_long_line_mm}mm seams>{anti.long_line_threshold_mm}={score.seams_over_threshold} "
             f"cross={score.cross_count} t_junctions={score.t_junction_count} policy={policy.strategy}\n"
         )
 
@@ -852,7 +1098,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     input_path = Path(args.input_json)
-    patio_full, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, policy, num_solutions, coverage_target, seed = parse_input(input_path)
+    patio_full, joint_mm, wall_gap_mm, perimeter_gap_mm, slabs, policy, anti, num_solutions, coverage_target, seed = parse_input(input_path)
 
     rng = random.Random(seed)
     inner = compute_inner_rect(patio_full, wall_gap_mm, perimeter_gap_mm)
@@ -868,6 +1114,7 @@ def main() -> None:
         inner=inner,
         slabs=slabs,
         policy=policy,
+        anti=anti,
         joint_mm=joint_mm,
         num_solutions=num_solutions,
         coverage_target=coverage_target,
@@ -879,7 +1126,7 @@ def main() -> None:
     if not results:
         raise RuntimeError("No layouts generated within time limit")
 
-    write_outputs(Path("out"), patio_full, wall_gap_mm, joint_mm, results, slabs, policy)
+    write_outputs(Path("out"), patio_full, wall_gap_mm, joint_mm, results, slabs, policy, anti)
     print(f"Wrote {len(results)} layouts to out/", flush=True)
 
 
@@ -919,6 +1166,17 @@ Input JSON example
     },
     "min_remaining_ratio_for_small": 0.20,
     "late_stage_small_bonus": 2.0
+  },
+  "anti_pattern": {
+    "long_line_threshold_mm": 1200,
+    "max_allowed_long_line_mm": 1800,
+    "cross_reject": true,
+    "cross_reject_free_area_below": 0.08,
+    "long_line_reject": true,
+    "long_line_reject_free_area_below": 0.10,
+    "cross_penalty": 5000,
+    "t_junction_penalty": 150,
+    "long_line_penalty_factor": 1.0
   }
 }
 
